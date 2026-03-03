@@ -1,5 +1,6 @@
 <div align="center">
 <h1>FastGS: Training 3D Gaussian Splatting in 100 Seconds</h1> 
+<h2>CVPR 2026</h2> 
 
 [🌐 Homepage](https://fastgs.github.io/) | [📄 Paper](https://arxiv.org/abs/2511.04283) ｜[🤗 Pre-trained model](https://huggingface.co/Goodsleepeverday/fastgs)
 
@@ -21,6 +22,7 @@ FastGS is a **general acceleration framework** that supercharges 3D Gaussian Spl
 - **🔧 Easy Deployment**: Simple post-training tool for feedforward 3DGS that works out-of-the-box
 
 ## 📢 Latest Updates
+#### 🔥 **[2026.03]** The surface reconstruction code [Fast-PGSR](https://github.com/fastgs/FastGS/tree/fast-pgsr) has been released!
 #### 🎉 **[2026.02]** Our work has been accepted to CVPR 2026! 🤗🤗🤗
 #### 🥇 **[2026.01]** Our method was used as a component in the [winning solution](https://arxiv.org/pdf/2601.19489) (1st place🥇) of the **[SIGGRAPH Asia 2025 3DGS Fast Reconstruction Challenge](https://gaplab.cuhk.edu.cn/projects/gsRaceSIGA2025/index.html#awards)**. We sincerely thank the **3DV-CASIA** for their interest and adoption of our work.
 #### 🔥 **[2025.12.03]** The sparse-view reconstruction code [Fast-DropGaussian](https://github.com/fastgs/FastGS/tree/fast-dropgaussian) has been released!
