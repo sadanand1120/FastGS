@@ -37,11 +37,11 @@ FastGS is a **general acceleration framework** that supercharges 3D Gaussian Spl
 
 #### Released Modules
 - **Dynamic Scenes Reconstruction** — [Fast-D3DGS](https://github.com/fastgs/FastGS/tree/fast-d3dgs) (based on [Deformable-3D-Gaussians](https://github.com/ingra14m/Deformable-3D-Gaussians)) — Released
-- **Sparse-view Reconstruction** — [Fast-DropGaussian](https://github.com/fastgs/FastGS/tree/fast-dropgaussian) (based on [DropGaussian](https://github.com/DCVL-3D/DropGaussian_release)) — Released  
+- **Sparse-view Reconstruction** — [Fast-DropGaussian](https://github.com/fastgs/FastGS/tree/fast-dropgaussian) (based on [DropGaussian](https://github.com/DCVL-3D/DropGaussian_release)) — Released 
+- **Surface Reconstruction** — [Fast-PGSR](https://github.com/fastgs/FastGS/tree/fast-pgsr) (based on [PGSR](https://github.com/zju3dv/PGSR)) — Released 
 
 #### To Be Released After Paper Acceptance
 - **Autonomous Driving Scenes** — [street_gaussians](https://github.com/zju3dv/street_gaussians)
-- **Surface Reconstruction** — [PGSR](https://github.com/zju3dv/PGSR)  
 - **Large-scale Reconstruction** — [OctreeGS](https://github.com/city-super/Octree-GS/tree/main)
 - **SLAM** — [Photo-SLAM](https://github.com/HuajianUP/Photo-SLAM)  
 - **Backbone Enhancing** — [Mip-splatting](https://github.com/autonomousvision/mip-splatting)
