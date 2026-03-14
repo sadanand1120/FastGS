@@ -905,7 +905,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extract-batch-size", type=int, default=16, help="Max batch size for images with matching preprocessed shapes")
     parser.add_argument("--reextract", action="store_true", help="Recompute dense CLIP features even if cached")
 
-    parser.add_argument("--num-epochs", type=int, default=100)
+    parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=7e-4, help="README uses 7e-4; released train.py default is 1e-4")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=256)

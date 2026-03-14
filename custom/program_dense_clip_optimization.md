@@ -87,7 +87,19 @@ For each experiment:
 
 1. Inspect current git state.
 2. Make one coherent change.
-3. Commit the change before benchmarking.
+3. Stage and commit only the files that belong to that experiment:
+
+```bash
+git status --short
+git add custom/train_dense_clip_langsplat_autoencoder.py
+git add <other_intended_helper_files_only_if_you_modified_them>
+git commit -m "dense-clip-opt: <brief summary of the change>"
+```
+
+Rules:
+- Never use `git add -A`, `git add .`, or `git commit -a`.
+- Never stage unrelated repo files, surrounding user changes, logs, temp outputs, or `custom/dense_clip_optimization_results.tsv`.
+- If the experiment only changed one file, commit only that one file.
 4. Run `smoke`:
 
 ```bash

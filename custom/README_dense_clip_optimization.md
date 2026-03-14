@@ -1,6 +1,6 @@
 # Dense CLIP Autoencoder Optimization
 
-This setup is the `custom/` adaptation of the ideas from `custom/autoresearch`, specialized for optimizing [train_dense_clip_langsplat_autoencoder.py](/robodata/smodak/repos/FastGS/custom/train_dense_clip_langsplat_autoencoder.py).
+This is the local optimization harness for [train_dense_clip_langsplat_autoencoder.py](/robodata/smodak/repos/FastGS/custom/train_dense_clip_langsplat_autoencoder.py).
 
 The goal is narrow:
 - reduce end-to-end runtime
@@ -17,7 +17,7 @@ The goal is narrow:
   Fixed benchmark harness. It runs the target script with a fixed profile, captures a structured summary, projects runtime to 1000 images, and keeps raw logs in `custom/dense_clip_optimization_logs/`.
 
 - `program_dense_clip_optimization.md`
-  The agent operating instructions. This is the use-case-specific replacement for `custom/autoresearch/program.md`.
+  The agent operating instructions for this optimization workflow.
 
 - `analyze_dense_clip_optimization_results.py`
   Lightweight results summarizer for the benchmark TSV log.
