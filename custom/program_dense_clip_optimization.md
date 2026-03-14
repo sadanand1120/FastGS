@@ -85,9 +85,21 @@ Work in this order unless profiling clearly proves otherwise:
 
 For each experiment:
 
-1. Inspect current git state.
-2. Make one coherent change.
-3. Stage and commit only the files that belong to that experiment:
+Invariant:
+- `main` must contain only the current kept baseline plus accepted follow-up commits.
+- Discarded or crashed experiments must not remain in `main` history.
+
+1. Inspect current git state and confirm `main` is clean at the current kept baseline.
+2. Create a disposable experiment branch from that baseline:
+
+```bash
+BASE_COMMIT=$(git rev-parse --short HEAD)
+EXP_BRANCH="dense-clip-exp-${BASE_COMMIT}-$(date +%s)"
+git switch -c "$EXP_BRANCH"
+```
+
+3. Make one coherent change.
+4. Stage and commit only the files that belong to that experiment:
 
 ```bash
 git status --short
@@ -100,38 +112,43 @@ Rules:
 - Never use `git add -A`, `git add .`, or `git commit -a`.
 - Never stage unrelated repo files, surrounding user changes, logs, temp outputs, or `custom/dense_clip_optimization_results.tsv`.
 - If the experiment only changed one file, commit only that one file.
-4. Run `smoke`:
+5. Run `smoke`:
 
 ```bash
 python custom/benchmark_dense_clip_autoencoder.py --profile smoke > run_smoke.log 2>&1
 ```
 
-5. If `smoke` crashes, inspect `run_smoke.log`, fix or discard.
-6. If `smoke` succeeds, run `quality`:
+6. If `smoke` crashes, inspect `run_smoke.log`, then discard the branch or amend the experiment branch and rerun.
+7. If `smoke` succeeds, run `quality`:
 
 ```bash
 python custom/benchmark_dense_clip_autoencoder.py --profile quality > run_quality.log 2>&1
 ```
 
-7. Extract the summary from `run_quality.log` and append a TSV row.
-8. Keep the commit only if it is a real win.
-9. If not a win, do not create a revert commit. Instead, rewind only the files from that experiment back to `HEAD^` and continue from there:
+8. Extract the summary from `run_quality.log` and append a TSV row.
+9. Keep the commit only if it is a real win.
+10. If it is a win, move it onto `main` and delete the disposable branch:
 
 ```bash
-git restore --source=HEAD^ --staged --worktree custom/train_dense_clip_langsplat_autoencoder.py
-git restore --source=HEAD^ --staged --worktree <other_intended_helper_files_only_if_that_experiment_touched_them>
+EXP_COMMIT=$(git rev-parse HEAD)
+git switch main
+git cherry-pick "$EXP_COMMIT"
+git branch -D "$EXP_BRANCH"
 ```
 
-Equivalent older-git pattern if needed:
+11. If it is not a win, do not create a revert commit and do not leave the branch merged. Just return to `main` and delete the disposable branch:
 
 ```bash
-git reset HEAD^ -- custom/train_dense_clip_langsplat_autoencoder.py
-git checkout -- custom/train_dense_clip_langsplat_autoencoder.py
+git switch main
+git branch -D "$EXP_BRANCH"
 ```
 
 Rules:
 - Never use `git revert` for discarded experiments.
+- Never benchmark a discard candidate directly on `main`.
+- Never create a "restore baseline" commit whose only purpose is undoing a discard.
 - Never rewind unrelated files or surrounding user changes.
+- `main` should advance only when a kept experiment is cherry-picked back.
 
 ## Keep / Discard Guidance
 

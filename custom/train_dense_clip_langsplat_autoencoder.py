@@ -37,7 +37,11 @@ If images are elsewhere, outputs go to <images_dir>/dense_clip_outputs by defaul
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 import json
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -51,6 +55,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.io import ImageReadMode, read_image
 
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
@@ -157,15 +162,104 @@ def load_and_preprocess_rgb(
     patch_size: int,
     padding_mode: str,
 ) -> torch.Tensor:
-    img = Image.open(path).convert("RGB")
+    tensor = read_image(str(path), mode=ImageReadMode.RGB).to(torch.float32).div_(255.0)
     if load_size is not None:
-        resolved_size = abs(load_size) * min(img.size) if load_size < 0 else load_size
-        img = resize_shortest_side(img, int(resolved_size))
+        height, width = tensor.shape[-2:]
+        resolved_size = abs(load_size) * min(width, height) if load_size < 0 else load_size
+        resized_height, resized_width = resolve_resized_hw(width, height, int(resolved_size))
+        tensor = F.interpolate(
+            tensor.unsqueeze(0),
+            size=(resized_height, resized_width),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        ).squeeze(0)
         if center_crop:
-            img = center_crop_square(img, int(resolved_size))
-    arr = np.asarray(img, dtype=np.float32) / 255.0
-    tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-    return pad_to_multiple_bchw(tensor, patch_size, mode=padding_mode).squeeze(0)
+            crop_height = min(resized_height, int(resolved_size))
+            crop_width = min(resized_width, int(resolved_size))
+            top = max((resized_height - crop_height) // 2, 0)
+            left = max((resized_width - crop_width) // 2, 0)
+            tensor = tensor[:, top:top + crop_height, left:left + crop_width]
+    return pad_to_multiple_bchw(tensor.unsqueeze(0), patch_size, mode=padding_mode).squeeze(0)
+
+
+def iter_preprocessed_images(
+    paths: Sequence[Path],
+    load_size: int | None,
+    center_crop: bool,
+    patch_size: int,
+    padding_mode: str,
+) -> Iterator[tuple[Path, torch.Tensor]]:
+    max_workers = min(len(paths), max(1, min(8, os.cpu_count() or 1)))
+    if max_workers <= 1:
+        for path in paths:
+            yield path, load_and_preprocess_rgb(
+                path,
+                load_size=load_size,
+                center_crop=center_crop,
+                patch_size=patch_size,
+                padding_mode=padding_mode,
+            )
+        return
+
+    path_iter = iter(paths)
+
+    def submit(executor: ThreadPoolExecutor, path: Path) -> Future[torch.Tensor]:
+        return executor.submit(
+            load_and_preprocess_rgb,
+            path,
+            load_size,
+            center_crop,
+            patch_size,
+            padding_mode,
+        )
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        inflight: deque[tuple[Path, Future[torch.Tensor]]] = deque()
+        for _ in range(max_workers * 2):
+            try:
+                path = next(path_iter)
+            except StopIteration:
+                break
+            inflight.append((path, submit(executor, path)))
+
+        while inflight:
+            path, future = inflight.popleft()
+            yield path, future.result()
+            try:
+                next_path = next(path_iter)
+            except StopIteration:
+                continue
+            inflight.append((next_path, submit(executor, next_path)))
+
+
+def resolve_resized_hw(width: int, height: int, size: int) -> tuple[int, int]:
+    if width <= height:
+        new_width = size
+        new_height = max(1, int(round(height * size / width)))
+    else:
+        new_height = size
+        new_width = max(1, int(round(width * size / height)))
+    return new_height, new_width
+
+
+def resolve_preprocessed_hw(
+    width: int,
+    height: int,
+    load_size: int | None,
+    center_crop: bool,
+    patch_size: int,
+) -> tuple[int, int]:
+    if load_size is not None:
+        resolved_size = abs(load_size) * min(width, height) if load_size < 0 else load_size
+        height, width = resolve_resized_hw(width, height, int(resolved_size))
+        if center_crop:
+            height = min(height, int(resolved_size))
+            width = min(width, int(resolved_size))
+
+    padded_height = height + ((-height) % patch_size)
+    padded_width = width + ((-width) % patch_size)
+    return padded_height, padded_width
 
 
 def interpolate_positional_embedding(
@@ -305,17 +399,22 @@ class DenseOpenCLIPExtractor(nn.Module):
         return x
 
     @torch.inference_mode()
-    def encode_dense(self, batch: torch.Tensor) -> torch.Tensor:
+    def encode_dense(self, batch: torch.Tensor, return_device_tensor: bool = False) -> torch.Tensor:
         """Returns [B, Gh, Gw, D] dense CLIP features."""
         batch = batch.to(torch.float32)
         batch = (batch - self.mean) / self.std
-        batch = batch.to(self.device)
-
-        patch_tokens = self._get_patch_encodings(batch)
+        batch = batch.to(device=self.device, non_blocking=self.device.type == "cuda")
+        if self.device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                patch_tokens = self._get_patch_encodings(batch)
+        else:
+            patch_tokens = self._get_patch_encodings(batch)
         gh = batch.shape[-2] // self.patch_size
         gw = batch.shape[-1] // self.patch_size
-        patch_tokens = patch_tokens.reshape(batch.shape[0], gh, gw, -1)
-        return patch_tokens.float().cpu()
+        patch_tokens = patch_tokens.reshape(batch.shape[0], gh, gw, -1).float()
+        if return_device_tensor:
+            return patch_tokens
+        return patch_tokens.cpu()
 
 
 def pca_rgb_map(
@@ -434,6 +533,14 @@ def safe_rate(count: int | float, seconds: float) -> float:
     return float(count) / seconds
 
 
+def configure_cuda_math_mode(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+
 def discover_images(images_dir: Path) -> List[Path]:
     return sorted([p for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES])
 
@@ -451,6 +558,7 @@ class FileInfo:
     stem: str
     highdim_path: Path
     lowdim_path: Path
+    cache_offset: int
     grid_h: int
     grid_w: int
     count: int
@@ -462,6 +570,13 @@ class FeatureCacheInfo:
     num_rows: int
     feature_dim: int
     dtype: str
+
+
+@dataclass
+class ExtractResult:
+    file_infos: list[FileInfo]
+    feature_cache: FeatureCacheInfo | None
+    device_feature_cache: torch.Tensor | None
 
 
 @dataclass
@@ -484,6 +599,36 @@ def save_selection_manifest(sample_infos: Sequence[FileInfo], out_path: Path) ->
         json.dump(rows, f, indent=2)
 
 
+def describe_feature_cache(
+    file_infos: Sequence[FileInfo],
+    feature_dim: int,
+) -> tuple[int, dict[str, object]]:
+    total_rows = 0
+    source_files: list[dict[str, int | str]] = []
+    for info in file_infos:
+        stat = info.highdim_path.stat()
+        total_rows += info.count
+        source_files.append(
+            {
+                "stem": info.stem,
+                "path": str(info.highdim_path),
+                "grid_h": info.grid_h,
+                "grid_w": info.grid_w,
+                "count": info.count,
+                "mtime_ns": int(stat.st_mtime_ns),
+                "size_bytes": int(stat.st_size),
+            }
+        )
+
+    expected_meta: dict[str, object] = {
+        "cache_dtype": "float16",
+        "num_rows": total_rows,
+        "feature_dim": feature_dim,
+        "source_files": source_files,
+    }
+    return total_rows, expected_meta
+
+
 @torch.inference_mode()
 def decode_lowdim_to_highdim(
     model: Autoencoder,
@@ -496,7 +641,9 @@ def decode_lowdim_to_highdim(
     chunks: list[np.ndarray] = []
     for start in range(0, flat.shape[0], batch_size):
         chunk = torch.from_numpy(flat[start:start + batch_size]).to(device)
-        recon = model.decode(chunk).float().cpu().numpy()
+        with cuda_autocast_context(device):
+            recon = model.decode(chunk)
+        recon = recon.float().cpu().numpy()
         chunks.append(recon)
     return np.concatenate(chunks, axis=0).reshape(lowdim.shape[0], lowdim.shape[1], -1)
 
@@ -530,7 +677,7 @@ def extract_dense_features(
     batch_size: int,
     reextract: bool,
     device: torch.device,
-) -> list[FileInfo]:
+) -> ExtractResult:
     highdim_dir = output_root / "dense_clip_features"
     lowdim_dir = output_root / "dense_clip_features_dim3"
     highdim_dir.mkdir(parents=True, exist_ok=True)
@@ -570,70 +717,195 @@ def extract_dense_features(
                 "Use --reextract to rebuild them."
             )
 
+    file_infos: list[FileInfo] = []
+    file_info_by_path: dict[Path, FileInfo] = {}
+    cache_offsets: dict[Path, int] = {}
+    total_rows = 0
+    for path in image_paths:
+        with Image.open(path) as image:
+            width, height = image.size
+        padded_height, padded_width = resolve_preprocessed_hw(
+            width=width,
+            height=height,
+            load_size=load_size,
+            center_crop=center_crop,
+            patch_size=extractor.patch_size,
+        )
+        grid_h = padded_height // extractor.patch_size
+        grid_w = padded_width // extractor.patch_size
+        info = FileInfo(
+            stem=path.stem,
+            highdim_path=highdim_dir / f"{path.stem}_f.npy",
+            lowdim_path=lowdim_dir / f"{path.stem}_f.npy",
+            cache_offset=total_rows,
+            grid_h=grid_h,
+            grid_w=grid_w,
+            count=grid_h * grid_w,
+        )
+        file_infos.append(info)
+        file_info_by_path[path] = info
+        cache_offsets[path] = info.cache_offset
+        total_rows += info.count
+
     pending: list[Path] = []
     for path in image_paths:
-        out_path = highdim_dir / f"{path.stem}_f.npy"
-        if reextract or not out_path.exists():
+        if reextract or not file_info_by_path[path].highdim_path.exists():
             pending.append(path)
+
+    cache_path = output_root / "dense_clip_feature_cache_fp16.npy"
+    cache_meta_path = output_root / "dense_clip_feature_cache_meta.json"
+    cache_memmap: np.memmap | None = None
+    feature_cache: FeatureCacheInfo | None = None
+    device_feature_cache = maybe_allocate_device_feature_cache(total_rows, feature_dim, device=device)
+    if pending:
+        cache_memmap = np.lib.format.open_memmap(
+            cache_path,
+            mode="w+",
+            dtype=np.float16,
+            shape=(total_rows, feature_dim),
+        )
+        pending_set = set(pending)
+        for path in image_paths:
+            if path in pending_set:
+                continue
+            info = file_info_by_path[path]
+            arr = np.load(info.highdim_path, mmap_mode="r")
+            expected_shape = (info.grid_h, info.grid_w, feature_dim)
+            if tuple(int(dim) for dim in arr.shape) != expected_shape:
+                raise ValueError(
+                    f"Expected {expected_shape} in {info.highdim_path}, got {arr.shape}. "
+                    "Use --reextract to rebuild them."
+                )
+            offset = cache_offsets[path]
+            flat = arr.reshape(-1, feature_dim)
+            cache_memmap[offset:offset + info.count] = flat.astype(np.float16)
+            if device_feature_cache is not None:
+                device_feature_cache[offset:offset + info.count].copy_(
+                    torch.from_numpy(flat).to(device=device, dtype=torch.float32)
+                )
 
     batch_paths: list[Path] = []
     batch_tensors: list[torch.Tensor] = []
     batch_shape: tuple[int, int, int] | None = None
+    pending_write_futures: deque[Future[None]] = deque()
+    transfer_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
 
-    def flush_batch() -> None:
+    def write_feature_batch(
+        paths: Sequence[Path],
+        feats_cpu: torch.Tensor,
+        transfer_event: torch.cuda.Event | None,
+        transfer_refs: Sequence[torch.Tensor],
+    ) -> None:
+        if transfer_event is not None:
+            transfer_event.synchronize()
+        feats = feats_cpu.numpy()
+        for i, path in enumerate(paths):
+            info = file_info_by_path[path]
+            feat = feats[i]
+            expected_shape = (info.grid_h, info.grid_w, feature_dim)
+            if tuple(int(dim) for dim in feat.shape) != expected_shape:
+                raise ValueError(f"Expected extracted feature shape {expected_shape} for {path}, got {feat.shape}")
+            np.save(info.highdim_path, feat)
+            if cache_memmap is not None:
+                offset = cache_offsets[path]
+                cache_memmap[offset:offset + info.count] = feat.reshape(-1, feature_dim)
+
+    def wait_for_pending_writes(limit: int = 0) -> None:
+        while len(pending_write_futures) > limit:
+            pending_write_futures.popleft().result()
+
+    def flush_batch(write_executor: ThreadPoolExecutor) -> None:
         nonlocal batch_shape
         if not batch_tensors:
             return
-        feats = extractor.encode_dense(torch.stack(batch_tensors, dim=0)).numpy()
-        for i, path in enumerate(batch_paths):
-            np.save(highdim_dir / f"{path.stem}_f.npy", feats[i])
+        batch = torch.stack(batch_tensors, dim=0)
+        if device.type == "cuda":
+            batch = batch.pin_memory()
+        feats_device = extractor.encode_dense(batch, return_device_tensor=device_feature_cache is not None)
+        paths = tuple(batch_paths)
+        for i, path in enumerate(paths):
+            info = file_info_by_path[path]
+            offset = cache_offsets[path]
+            if device_feature_cache is not None:
+                device_feature_cache[offset:offset + info.count].copy_(feats_device[i].reshape(-1, feature_dim))
+        if device.type == "cuda":
+            feats_cpu = torch.empty(
+                feats_device.shape,
+                dtype=torch.float16,
+                device="cpu",
+                pin_memory=True,
+            )
+            with torch.cuda.stream(transfer_stream):
+                transfer_stream.wait_stream(torch.cuda.current_stream(device))
+                feats_half = feats_device.to(dtype=torch.float16)
+                feats_cpu.copy_(feats_half, non_blocking=True)
+                transfer_event = torch.cuda.Event()
+                transfer_event.record(transfer_stream)
+            transfer_refs: tuple[torch.Tensor, ...] = (feats_device, feats_half)
+        else:
+            feats_cpu = feats_device.to(dtype=torch.float16).cpu()
+            transfer_event = None
+            transfer_refs = (feats_device,)
+        wait_for_pending_writes(limit=0)
+        pending_write_futures.append(
+            write_executor.submit(write_feature_batch, paths, feats_cpu, transfer_event, transfer_refs)
+        )
         batch_paths.clear()
         batch_tensors.clear()
         batch_shape = None
 
-    for path in tqdm(pending, desc="Extracting dense CLIP patches"):
-        tensor = load_and_preprocess_rgb(
-            path,
+    with ThreadPoolExecutor(max_workers=1) as write_executor:
+        preprocessed_images = iter_preprocessed_images(
+            pending,
             load_size=load_size,
             center_crop=center_crop,
             patch_size=extractor.patch_size,
             padding_mode=padding_mode,
         )
-        shape = tuple(int(dim) for dim in tensor.shape)
-        if batch_tensors and (shape != batch_shape or len(batch_tensors) >= batch_size):
-            flush_batch()
-        batch_paths.append(path)
-        batch_tensors.append(tensor)
-        batch_shape = shape
-    flush_batch()
+        for path, tensor in tqdm(preprocessed_images, total=len(pending), desc="Extracting dense CLIP patches"):
+            shape = tuple(int(dim) for dim in tensor.shape)
+            if batch_tensors and (shape != batch_shape or len(batch_tensors) >= batch_size):
+                flush_batch(write_executor)
+            batch_paths.append(path)
+            batch_tensors.append(tensor)
+            batch_shape = shape
+        flush_batch(write_executor)
+        wait_for_pending_writes()
 
-    file_infos: list[FileInfo] = []
-    for path in image_paths:
-        arr = np.load(highdim_dir / f"{path.stem}_f.npy", mmap_mode="r")
-        if arr.ndim != 3:
-            raise ValueError(f"Expected [Gh, Gw, D] in {path.stem}_f.npy, got {arr.shape}")
-        if arr.shape[-1] != feature_dim:
-            raise ValueError(
-                f"Expected feature dim {feature_dim} in {path.stem}_f.npy, got {arr.shape[-1]}. "
-                "Use --reextract if cached features were produced with different CLIP settings."
-            )
-        file_infos.append(
-            FileInfo(
-                stem=path.stem,
-                highdim_path=highdim_dir / f"{path.stem}_f.npy",
-                lowdim_path=lowdim_dir / f"{path.stem}_f.npy",
-                grid_h=int(arr.shape[0]),
-                grid_w=int(arr.shape[1]),
-                count=int(arr.shape[0] * arr.shape[1]),
-            )
+    if cache_memmap is not None:
+        cache_memmap.flush()
+        del cache_memmap
+        cache_total_rows, expected_cache_meta = describe_feature_cache(file_infos, feature_dim)
+        with open(cache_meta_path, "w", encoding="utf-8") as f:
+            json.dump(expected_cache_meta, f, indent=2)
+        feature_cache = FeatureCacheInfo(
+            path=cache_path,
+            num_rows=cache_total_rows,
+            feature_dim=feature_dim,
+            dtype="float16",
         )
+    elif cache_path.exists() and cache_meta_path.exists():
+        cache_total_rows, expected_cache_meta = describe_feature_cache(file_infos, feature_dim)
+        with open(cache_meta_path, "r", encoding="utf-8") as f:
+            cached_meta = json.load(f)
+        if cached_meta == expected_cache_meta:
+            feature_cache = FeatureCacheInfo(
+                path=cache_path,
+                num_rows=cache_total_rows,
+                feature_dim=feature_dim,
+                dtype="float16",
+            )
 
     meta = dict(expected_meta)
     meta["feature_dim"] = feature_dim
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    return file_infos
+    return ExtractResult(
+        file_infos=file_infos,
+        feature_cache=feature_cache,
+        device_feature_cache=device_feature_cache,
+    )
 
 
 def build_feature_cache(
@@ -651,29 +923,7 @@ def build_feature_cache(
     feature_dim = int(first_arr.shape[-1])
     del first_arr
 
-    total_rows = 0
-    source_files: list[dict[str, int | str]] = []
-    for info in file_infos:
-        stat = info.highdim_path.stat()
-        total_rows += info.count
-        source_files.append(
-            {
-                "stem": info.stem,
-                "path": str(info.highdim_path),
-                "grid_h": info.grid_h,
-                "grid_w": info.grid_w,
-                "count": info.count,
-                "mtime_ns": int(stat.st_mtime_ns),
-                "size_bytes": int(stat.st_size),
-            }
-        )
-
-    expected_meta = {
-        "cache_dtype": "float16",
-        "num_rows": total_rows,
-        "feature_dim": feature_dim,
-        "source_files": source_files,
-    }
+    total_rows, expected_meta = describe_feature_cache(file_infos, feature_dim)
 
     if cache_path.exists() and meta_path.exists():
         with open(meta_path, "r", encoding="utf-8") as f:
@@ -751,11 +1001,79 @@ def iterate_feature_cache_batches(
             yield batch.to(device=device, dtype=torch.float32, non_blocking=pin_memory)
 
 
+def maybe_load_feature_cache_to_device(
+    cache_info: FeatureCacheInfo,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if device.type != "cuda":
+        return None
+
+    cache_bytes = cache_info.num_rows * cache_info.feature_dim * 4
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    if cache_bytes > int(free_bytes * 0.7):
+        return None
+
+    cache_np = np.load(cache_info.path, mmap_mode="r+")
+    cache_cpu = torch.from_numpy(cache_np)
+    return cache_cpu.to(device=device, dtype=torch.float32)
+
+
+def maybe_allocate_device_feature_cache(
+    num_rows: int,
+    feature_dim: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if device.type != "cuda":
+        return None
+
+    cache_bytes = num_rows * feature_dim * 4
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    if cache_bytes > int(free_bytes * 0.7):
+        return None
+
+    return torch.empty((num_rows, feature_dim), device=device, dtype=torch.float32)
+
+
+def iterate_device_feature_cache_batches(
+    cache_tensor: torch.Tensor,
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+    drop_single_sample: bool,
+) -> Iterator[torch.Tensor]:
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+    num_rows = int(cache_tensor.shape[0])
+    if shuffle:
+        generator = torch.Generator(device=cache_tensor.device)
+        generator.manual_seed(seed)
+        order = torch.randperm(num_rows, device=cache_tensor.device, generator=generator)
+        for start in range(0, num_rows, batch_size):
+            batch_indices = order[start:start + batch_size]
+            if drop_single_sample and batch_indices.shape[0] == 1:
+                continue
+            yield cache_tensor.index_select(0, batch_indices)
+        return
+
+    for start in range(0, num_rows, batch_size):
+        batch = cache_tensor[start:start + batch_size]
+        if drop_single_sample and batch.shape[0] == 1:
+            continue
+        yield batch
+
+
 def resolve_decoder_dims(decoder_dims: Sequence[int], output_dim: int) -> list[int]:
     resolved = list(decoder_dims)
     if not resolved or resolved[-1] != output_dim:
         resolved.append(output_dim)
     return resolved
+
+
+def cuda_autocast_context(device: torch.device):
+    if device.type != "cuda":
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 
 def train_autoencoder(
@@ -768,11 +1086,15 @@ def train_autoencoder(
     batch_size: int,
     eval_batch_size: int,
     cache_block_rows: int,
+    eval_every: int,
     seed: int,
     device: torch.device,
+    device_feature_cache: torch.Tensor | None = None,
 ) -> tuple[Autoencoder, list[dict], TrainSummary]:
     ckpt_dir = output_root / "clip_autoencoder_ckpt"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if eval_every <= 0:
+        raise ValueError(f"eval_every must be positive, got {eval_every}")
 
     resolved_decoder_dims = resolve_decoder_dims(decoder_dims, feature_cache.feature_dim)
     model = Autoencoder(
@@ -780,6 +1102,13 @@ def train_autoencoder(
         decoder_dims=resolved_decoder_dims,
         input_dim=feature_cache.feature_dim,
     ).to(device)
+    if device_feature_cache is None:
+        device_feature_cache = maybe_load_feature_cache_to_device(feature_cache, device=device)
+    if device_feature_cache is not None:
+        print(
+            f"Loaded full feature cache on {device}: "
+            f"({device_feature_cache.shape[0]}, {device_feature_cache.shape[1]})"
+        )
     runtime_model: nn.Module = model
     if device.type == "cuda":
         runtime_model = torch.compile(model, mode="reduce-overhead")
@@ -795,17 +1124,29 @@ def train_autoencoder(
         epoch_mse = 0.0
         epoch_seen = 0
 
-        for batch in iterate_feature_cache_batches(
-            feature_cache,
-            batch_size=batch_size,
-            block_rows=cache_block_rows,
-            shuffle=True,
-            seed=seed + epoch,
-            device=device,
-            drop_single_sample=True,
-        ):
-            recon = runtime_model(batch)
-            mse = mse_loss(recon, batch)
+        train_batches = (
+            iterate_device_feature_cache_batches(
+                device_feature_cache,
+                batch_size=batch_size,
+                shuffle=True,
+                seed=seed + epoch,
+                drop_single_sample=True,
+            )
+            if device_feature_cache is not None
+            else iterate_feature_cache_batches(
+                feature_cache,
+                batch_size=batch_size,
+                block_rows=cache_block_rows,
+                shuffle=True,
+                seed=seed + epoch,
+                device=device,
+                drop_single_sample=True,
+            )
+        )
+        for batch in train_batches:
+            with cuda_autocast_context(device):
+                recon = runtime_model(batch)
+                mse = mse_loss(recon, batch)
             optimizer.zero_grad(set_to_none=True)
             mse.backward()
             optimizer.step()
@@ -817,27 +1158,42 @@ def train_autoencoder(
         if epoch_seen == 0:
             raise RuntimeError("No training batches were processed.")
 
-        runtime_model.eval()
-        eval_mse_sum = 0.0
-        eval_seen = 0
-        with torch.no_grad():
-            for batch in iterate_feature_cache_batches(
-                feature_cache,
-                batch_size=eval_batch_size,
-                block_rows=cache_block_rows,
-                shuffle=False,
-                seed=seed,
-                device=device,
-                drop_single_sample=False,
-            ):
-                recon = runtime_model(batch)
-                mse = mse_loss(recon, batch)
-                bs = int(batch.shape[0])
-                eval_seen += bs
-                eval_mse_sum += float(mse.item()) * bs
-
         train_epoch_mse = epoch_mse / epoch_seen
-        eval_epoch_mse = eval_mse_sum / eval_seen
+        should_eval = ((epoch + 1) % eval_every == 0) or (epoch == num_epochs - 1)
+        if should_eval:
+            runtime_model.eval()
+            eval_mse_sum = 0.0
+            eval_seen = 0
+            with torch.no_grad():
+                eval_batches = (
+                    iterate_device_feature_cache_batches(
+                        device_feature_cache,
+                        batch_size=eval_batch_size,
+                        shuffle=False,
+                        seed=seed,
+                        drop_single_sample=False,
+                    )
+                    if device_feature_cache is not None
+                    else iterate_feature_cache_batches(
+                        feature_cache,
+                        batch_size=eval_batch_size,
+                        block_rows=cache_block_rows,
+                        shuffle=False,
+                        seed=seed,
+                        device=device,
+                        drop_single_sample=False,
+                    )
+                )
+                for batch in eval_batches:
+                    with cuda_autocast_context(device):
+                        recon = runtime_model(batch)
+                        mse = mse_loss(recon, batch)
+                    bs = int(batch.shape[0])
+                    eval_seen += bs
+                    eval_mse_sum += float(mse.item()) * bs
+            eval_epoch_mse = eval_mse_sum / eval_seen
+        else:
+            eval_epoch_mse = float("nan")
 
         log_row = {
             "epoch": epoch,
@@ -849,7 +1205,7 @@ def train_autoencoder(
             f"epoch={epoch:03d} train_mse={train_epoch_mse:.6f} eval_mse={eval_epoch_mse:.6f}"
         )
 
-        if eval_epoch_mse < best_eval:
+        if should_eval and eval_epoch_mse < best_eval:
             best_eval = eval_epoch_mse
             best_epoch = epoch
             best_state_dict = {
@@ -879,15 +1235,27 @@ def export_lowdim_features(
     file_infos: Sequence[FileInfo],
     batch_size: int,
     device: torch.device,
+    device_feature_cache: torch.Tensor | None = None,
 ) -> None:
     for info in tqdm(file_infos, desc="Exporting 3-D latent maps"):
-        arr = np.load(info.highdim_path).astype(np.float32)
-        flat = arr.reshape(-1, arr.shape[-1])
         latents: list[np.ndarray] = []
-        for start in range(0, flat.shape[0], batch_size):
-            chunk = torch.from_numpy(flat[start:start + batch_size]).to(device)
-            z = model.encode(chunk).float().cpu().numpy()
-            latents.append(z)
+        if device_feature_cache is not None:
+            flat = device_feature_cache[info.cache_offset:info.cache_offset + info.count]
+            for start in range(0, int(flat.shape[0]), batch_size):
+                chunk = flat[start:start + batch_size]
+                with cuda_autocast_context(device):
+                    z = model.encode(chunk)
+                z = z.float().cpu().numpy()
+                latents.append(z)
+        else:
+            arr = np.load(info.highdim_path).astype(np.float32)
+            flat = arr.reshape(-1, arr.shape[-1])
+            for start in range(0, flat.shape[0], batch_size):
+                chunk = torch.from_numpy(flat[start:start + batch_size]).to(device)
+                with cuda_autocast_context(device):
+                    z = model.encode(chunk)
+                z = z.float().cpu().numpy()
+                latents.append(z)
         out = np.concatenate(latents, axis=0).reshape(info.grid_h, info.grid_w, -1)
         np.save(info.lowdim_path, out)
 
@@ -914,8 +1282,9 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--num-epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3, help="README uses 7e-4; released train.py default is 1e-4")
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--eval-batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=2048)
+    parser.add_argument("--eval-batch-size", type=int, default=4096)
+    parser.add_argument("--eval-every", type=int, default=2, help="Run full evaluation every N epochs, always including the final epoch.")
     parser.add_argument(
         "--cache-block-rows",
         type=int,
@@ -943,6 +1312,7 @@ def main() -> None:
     output_root = resolve_output_root(images_dir, args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
+    configure_cuda_math_mode(device)
     clip_load_size = None if args.clip_load_size == 0 else args.clip_load_size
     total_start = time.perf_counter()
     if device.type == "cuda":
@@ -963,6 +1333,7 @@ def main() -> None:
         "lr": args.lr,
         "batch_size": args.batch_size,
         "eval_batch_size": args.eval_batch_size,
+        "eval_every": args.eval_every,
         "cache_block_rows": args.cache_block_rows,
         "encoder_dims": args.encoder_dims,
         "decoder_dims": args.decoder_dims,
@@ -976,7 +1347,7 @@ def main() -> None:
         json.dump(config, f, indent=2)
 
     extract_start = time.perf_counter()
-    file_infos = extract_dense_features(
+    extract_result = extract_dense_features(
         images_dir=images_dir,
         output_root=output_root,
         model_name=args.clip_model_type,
@@ -989,9 +1360,13 @@ def main() -> None:
         device=device,
     )
     extract_seconds = time.perf_counter() - extract_start
+    file_infos = extract_result.file_infos
+    device_feature_cache = extract_result.device_feature_cache
 
     cache_start = time.perf_counter()
-    feature_cache = build_feature_cache(file_infos, output_root=output_root)
+    feature_cache = extract_result.feature_cache
+    if feature_cache is None:
+        feature_cache = build_feature_cache(file_infos, output_root=output_root)
     cache_seconds = time.perf_counter() - cache_start
     print(f"Prepared fp16 feature cache: ({feature_cache.num_rows}, {feature_cache.feature_dim})")
 
@@ -1018,8 +1393,10 @@ def main() -> None:
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
         cache_block_rows=args.cache_block_rows,
+        eval_every=args.eval_every,
         seed=args.seed,
         device=device,
+        device_feature_cache=device_feature_cache,
     )
     train_seconds = time.perf_counter() - train_start
 
@@ -1029,6 +1406,7 @@ def main() -> None:
         file_infos=file_infos,
         batch_size=args.eval_batch_size,
         device=device,
+        device_feature_cache=device_feature_cache,
     )
     export_seconds = time.perf_counter() - export_start
 
