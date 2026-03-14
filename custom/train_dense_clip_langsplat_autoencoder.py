@@ -60,6 +60,7 @@ from torchvision.io import ImageReadMode, read_image
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+FLOAT16_MAX = float(np.finfo(np.float16).max)
 
 
 def seed_everything(seed: int) -> None:
@@ -647,18 +648,22 @@ def decode_lowdim_to_highdim(
         chunks.append(recon)
     return np.concatenate(chunks, axis=0).reshape(lowdim.shape[0], lowdim.shape[1], -1)
 
-
 def save_final_pca_comparison(
     model: Autoencoder,
     sample_infos: Sequence[FileInfo],
     out_path: Path,
     batch_size: int,
     device: torch.device,
+    device_feature_cache: torch.Tensor | None = None,
     scale: int = 4,
 ) -> None:
     rows: list[tuple[str, np.ndarray, np.ndarray]] = []
     for info in sample_infos:
-        highdim = np.load(info.highdim_path)
+        if device_feature_cache is None:
+            highdim = np.load(info.highdim_path)
+        else:
+            flat = device_feature_cache[info.cache_offset:info.cache_offset + info.count]
+            highdim = flat.reshape(info.grid_h, info.grid_w, -1).cpu().numpy()
         highdim_rgb, projection = pca_rgb_map(highdim)
         recon = decode_lowdim_to_highdim(model, info.lowdim_path, batch_size=batch_size, device=device)
         recon_rgb, _ = pca_rgb_map(recon, projection=projection)
@@ -702,6 +707,7 @@ def extract_dense_features(
         "clip_center_crop": center_crop,
         "clip_padding_mode": padding_mode,
         "clip_feature_normalization": "none",
+        "disk_overflow_policy": "clip_float16_range",
         "patch_size": extractor.patch_size,
         "grid_mode": "per_image",
         "images_dir": str(images_dir),
@@ -756,8 +762,9 @@ def extract_dense_features(
     cache_meta_path = output_root / "dense_clip_feature_cache_meta.json"
     cache_memmap: np.memmap | None = None
     feature_cache: FeatureCacheInfo | None = None
-    device_feature_cache = maybe_allocate_device_feature_cache(total_rows, feature_dim, device=device)
+    device_feature_cache = None
     if pending:
+        device_feature_cache = maybe_allocate_device_feature_cache(total_rows, feature_dim, device=device)
         cache_memmap = np.lib.format.open_memmap(
             cache_path,
             mode="w+",
@@ -792,29 +799,16 @@ def extract_dense_features(
 
     def write_feature_batch(
         paths: Sequence[Path],
-        feats_cpu: torch.Tensor,
-        transfer_event: torch.cuda.Event | None,
-        transfer_refs: Sequence[torch.Tensor],
+        feats: np.ndarray,
     ) -> None:
-        if transfer_event is not None:
-            transfer_event.synchronize()
-        feats = feats_cpu.numpy()
         for i, path in enumerate(paths):
-            info = file_info_by_path[path]
-            feat = feats[i]
-            expected_shape = (info.grid_h, info.grid_w, feature_dim)
-            if tuple(int(dim) for dim in feat.shape) != expected_shape:
-                raise ValueError(f"Expected extracted feature shape {expected_shape} for {path}, got {feat.shape}")
-            np.save(info.highdim_path, feat)
-            if cache_memmap is not None:
-                offset = cache_offsets[path]
-                cache_memmap[offset:offset + info.count] = feat.reshape(-1, feature_dim)
+            np.save(file_info_by_path[path].highdim_path, feats[i])
 
     def wait_for_pending_writes(limit: int = 0) -> None:
         while len(pending_write_futures) > limit:
             pending_write_futures.popleft().result()
 
-    def flush_batch(write_executor: ThreadPoolExecutor) -> None:
+    def flush_batch() -> None:
         nonlocal batch_shape
         if not batch_tensors:
             return
@@ -828,6 +822,7 @@ def extract_dense_features(
             offset = cache_offsets[path]
             if device_feature_cache is not None:
                 device_feature_cache[offset:offset + info.count].copy_(feats_device[i].reshape(-1, feature_dim))
+        feats_half = feats_device.clamp(min=-FLOAT16_MAX, max=FLOAT16_MAX).to(dtype=torch.float16)
         if device.type == "cuda":
             feats_cpu = torch.empty(
                 feats_device.shape,
@@ -837,19 +832,22 @@ def extract_dense_features(
             )
             with torch.cuda.stream(transfer_stream):
                 transfer_stream.wait_stream(torch.cuda.current_stream(device))
-                feats_half = feats_device.to(dtype=torch.float16)
                 feats_cpu.copy_(feats_half, non_blocking=True)
-                transfer_event = torch.cuda.Event()
-                transfer_event.record(transfer_stream)
-            transfer_refs: tuple[torch.Tensor, ...] = (feats_device, feats_half)
+            transfer_stream.synchronize()
         else:
-            feats_cpu = feats_device.to(dtype=torch.float16).cpu()
-            transfer_event = None
-            transfer_refs = (feats_device,)
+            feats_cpu = feats_half.cpu()
+        feats_np = feats_cpu.numpy()
+        for i, path in enumerate(paths):
+            info = file_info_by_path[path]
+            feat = feats_np[i]
+            expected_shape = (info.grid_h, info.grid_w, feature_dim)
+            if tuple(int(dim) for dim in feat.shape) != expected_shape:
+                raise ValueError(f"Expected extracted feature shape {expected_shape} for {path}, got {feat.shape}")
+            if cache_memmap is not None:
+                offset = cache_offsets[path]
+                cache_memmap[offset:offset + info.count] = feat.reshape(-1, feature_dim)
         wait_for_pending_writes(limit=0)
-        pending_write_futures.append(
-            write_executor.submit(write_feature_batch, paths, feats_cpu, transfer_event, transfer_refs)
-        )
+        pending_write_futures.append(write_executor.submit(write_feature_batch, paths, feats_np))
         batch_paths.clear()
         batch_tensors.clear()
         batch_shape = None
@@ -865,11 +863,11 @@ def extract_dense_features(
         for path, tensor in tqdm(preprocessed_images, total=len(pending), desc="Extracting dense CLIP patches"):
             shape = tuple(int(dim) for dim in tensor.shape)
             if batch_tensors and (shape != batch_shape or len(batch_tensors) >= batch_size):
-                flush_batch(write_executor)
+                flush_batch()
             batch_paths.append(path)
             batch_tensors.append(tensor)
             batch_shape = shape
-        flush_batch(write_executor)
+        flush_batch()
         wait_for_pending_writes()
 
     if cache_memmap is not None:
@@ -1417,6 +1415,7 @@ def main() -> None:
         out_path=viz_dir / "pca_comparison.png",
         batch_size=args.eval_batch_size,
         device=device,
+        device_feature_cache=device_feature_cache,
         scale=max(1, args.viz_scale),
     )
     viz_seconds = time.perf_counter() - viz_start

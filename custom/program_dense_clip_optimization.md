@@ -56,6 +56,7 @@ The benchmark dataset is still smaller than the target full-scale scenes, so do 
 - No deleting required outputs just to benchmark faster.
 - No benchmark-specific branches in the target script.
 - No hacks that rely on the benchmark always using the current trial set size.
+- No accepting a change on runtime/MSE alone if the saved PCA comparison gallery is visibly wrong or corrupted.
 
 ## Optimization Ladder (suggestive, not prescriptive)
 
@@ -125,9 +126,16 @@ python custom/benchmark_dense_clip_autoencoder.py --profile smoke > run_smoke.lo
 python custom/benchmark_dense_clip_autoencoder.py --profile quality > run_quality.log 2>&1
 ```
 
-8. Extract the summary from `run_quality.log` and append a TSV row.
-9. Keep the commit only if it is a real win.
-10. If it is a win, move it onto `main` and delete the disposable branch:
+8. Inspect the saved `clip_autoencoder_viz/pca_comparison.png` from the `quality` run before accepting anything.
+
+Correctness gate:
+- each row must compare the same sample on both sides
+- no obvious swapped frames, spatial mismatch, NaN/Inf blowups, or severe clipping/corruption
+- if the PCA gallery looks wrong, discard or debug the experiment even if timing/MSE improved
+
+9. Extract the summary from `run_quality.log` and append a TSV row.
+10. Keep the commit only if it is a real win and passes the PCA-gallery correctness check.
+11. If it is a win, move it onto `main` and delete the disposable branch:
 
 ```bash
 EXP_COMMIT=$(git rev-parse HEAD)
@@ -136,7 +144,7 @@ git cherry-pick "$EXP_COMMIT"
 git branch -D "$EXP_BRANCH"
 ```
 
-11. If it is not a win, do not create a revert commit and do not leave the branch merged. Just return to `main` and delete the disposable branch:
+12. If it is not a win, do not create a revert commit and do not leave the branch merged. Just return to `main` and delete the disposable branch:
 
 ```bash
 git switch main
