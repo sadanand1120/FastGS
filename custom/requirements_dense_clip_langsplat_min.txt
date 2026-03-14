@@ -1,0 +1,6 @@
+# Minimal dependencies for train_dense_clip_langsplat_autoencoder.py
+numpy>=1.24
+pillow>=9.0
+tqdm>=4.64
+open-clip-torch>=2.23.0
+# Install torch/torchvision using the CUDA build appropriate for your machine.
