@@ -780,14 +780,18 @@ def train_autoencoder(
         decoder_dims=resolved_decoder_dims,
         input_dim=feature_cache.feature_dim,
     ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    runtime_model: nn.Module = model
+    if device.type == "cuda":
+        runtime_model = torch.compile(model, mode="reduce-overhead")
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=device.type == "cuda")
 
     best_eval = float("inf")
     best_epoch = -1
+    best_state_dict: dict[str, torch.Tensor] | None = None
     train_log: list[dict] = []
 
     for epoch in range(num_epochs):
-        model.train()
+        runtime_model.train()
         epoch_mse = 0.0
         epoch_seen = 0
 
@@ -800,8 +804,7 @@ def train_autoencoder(
             device=device,
             drop_single_sample=True,
         ):
-            z = model.encode(batch)
-            recon = model.decode(z)
+            recon = runtime_model(batch)
             mse = mse_loss(recon, batch)
             optimizer.zero_grad(set_to_none=True)
             mse.backward()
@@ -814,7 +817,7 @@ def train_autoencoder(
         if epoch_seen == 0:
             raise RuntimeError("No training batches were processed.")
 
-        model.eval()
+        runtime_model.eval()
         eval_mse_sum = 0.0
         eval_seen = 0
         with torch.no_grad():
@@ -827,7 +830,7 @@ def train_autoencoder(
                 device=device,
                 drop_single_sample=False,
             ):
-                recon = model(batch)
+                recon = runtime_model(batch)
                 mse = mse_loss(recon, batch)
                 bs = int(batch.shape[0])
                 eval_seen += bs
@@ -849,7 +852,9 @@ def train_autoencoder(
         if eval_epoch_mse < best_eval:
             best_eval = eval_epoch_mse
             best_epoch = epoch
-            torch.save(model.state_dict(), ckpt_dir / "best_ckpt.pth")
+            best_state_dict = {
+                name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()
+            }
 
         if epoch % 10 == 0 or epoch == num_epochs - 1:
             torch.save(model.state_dict(), ckpt_dir / f"epoch_{epoch:03d}.pth")
@@ -860,8 +865,10 @@ def train_autoencoder(
     with open(ckpt_dir / "best.txt", "w", encoding="utf-8") as f:
         f.write(json.dumps({"best_epoch": best_epoch, "best_eval": best_eval}, indent=2))
 
-    best_ckpt = torch.load(ckpt_dir / "best_ckpt.pth", map_location=device)
-    model.load_state_dict(best_ckpt)
+    if best_state_dict is None:
+        raise RuntimeError("Failed to capture a best checkpoint during training.")
+    torch.save(best_state_dict, ckpt_dir / "best_ckpt.pth")
+    model.load_state_dict(best_state_dict)
     model.eval()
     return model, train_log, TrainSummary(best_epoch=best_epoch, best_eval_mse=best_eval)
 
@@ -905,9 +912,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extract-batch-size", type=int, default=16, help="Max batch size for images with matching preprocessed shapes")
     parser.add_argument("--reextract", action="store_true", help="Recompute dense CLIP features even if cached")
 
-    parser.add_argument("--num-epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=7e-4, help="README uses 7e-4; released train.py default is 1e-4")
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--num-epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=1e-3, help="README uses 7e-4; released train.py default is 1e-4")
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument(
         "--cache-block-rows",

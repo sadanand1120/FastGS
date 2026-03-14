@@ -47,7 +47,7 @@ Primary objective:
 Constraint:
 - do not materially worsen `best_eval_mse`
 
-The benchmark dataset is small, so do not game it. Every change must still make sense for arbitrary scenes with roughly 1000 images.
+The benchmark dataset is still smaller than the target full-scale scenes, so do not game it. Every change must still make sense for arbitrary scenes with roughly 1000 images.
 
 ## Hard Constraints
 
@@ -55,7 +55,7 @@ The benchmark dataset is small, so do not game it. Every change must still make 
 - No fast paths that silently change semantics for larger scenes.
 - No deleting required outputs just to benchmark faster.
 - No benchmark-specific branches in the target script.
-- No hacks that rely on the benchmark always using 15 images.
+- No hacks that rely on the benchmark always using the current trial set size.
 
 ## Optimization Ladder (suggestive, not prescriptive)
 
@@ -115,7 +115,23 @@ python custom/benchmark_dense_clip_autoencoder.py --profile quality > run_qualit
 
 7. Extract the summary from `run_quality.log` and append a TSV row.
 8. Keep the commit only if it is a real win.
-9. If not a win, revert to the previous kept commit.
+9. If not a win, do not create a revert commit. Instead, rewind only the files from that experiment back to `HEAD^` and continue from there:
+
+```bash
+git restore --source=HEAD^ --staged --worktree custom/train_dense_clip_langsplat_autoencoder.py
+git restore --source=HEAD^ --staged --worktree <other_intended_helper_files_only_if_that_experiment_touched_them>
+```
+
+Equivalent older-git pattern if needed:
+
+```bash
+git reset HEAD^ -- custom/train_dense_clip_langsplat_autoencoder.py
+git checkout -- custom/train_dense_clip_langsplat_autoencoder.py
+```
+
+Rules:
+- Never use `git revert` for discarded experiments.
+- Never rewind unrelated files or surrounding user changes.
 
 ## Keep / Discard Guidance
 
@@ -130,7 +146,7 @@ Keep when:
 Discard when:
 - quality regresses clearly
 - speedup is tiny and complexity cost is high
-- the change only helps the tiny benchmark in a suspicious way
+- the change only helps the current benchmark set in a suspicious way
 
 ## Logging
 

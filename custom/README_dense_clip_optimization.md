@@ -32,15 +32,15 @@ The benchmark therefore emphasizes:
 - projected runtime for 1000 images
 - held quality metric from the target script: `best_eval_mse`
 
-This is not perfect, but it is much better than timing only the tiny 15-image trial set and calling it done.
+This is not perfect, but it is much better than timing only the current trial set and calling it done.
 
 ## Fixed Profiles
 
 - `smoke`
-  One epoch. Used as a quick crash/perf sanity check.
+  Five epochs. Used as a quick crash/perf sanity check.
 
 - `quality`
-  Ten epochs. Used for keep/discard decisions.
+  Fifty epochs. Used for keep/discard decisions.
 
 Both profiles force a full end-to-end run:
 - re-extract features
