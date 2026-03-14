@@ -37,10 +37,10 @@ This is not perfect, but it is much better than timing only the current trial se
 ## Fixed Profiles
 
 - `smoke`
-  Five epochs. Used as a quick crash/perf sanity check.
+  Two epochs. Used as a quick crash/perf sanity check.
 
 - `quality`
-  Fifty epochs. Used for keep/discard decisions.
+  Twenty epochs. Used for keep/discard decisions.
 
 Both profiles force a full end-to-end run:
 - re-extract features

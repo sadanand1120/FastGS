@@ -909,7 +909,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--clip-center-crop", action="store_true", help="Center crop after resize like clip_main")
     parser.add_argument("--clip-padding-mode", type=str, default="constant", help="Padding mode for patch-grid alignment")
-    parser.add_argument("--extract-batch-size", type=int, default=16, help="Max batch size for images with matching preprocessed shapes")
+    parser.add_argument("--extract-batch-size", type=int, default=32, help="Max batch size for images with matching preprocessed shapes")
     parser.add_argument("--reextract", action="store_true", help="Recompute dense CLIP features even if cached")
 
     parser.add_argument("--num-epochs", type=int, default=100)

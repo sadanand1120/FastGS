@@ -25,8 +25,8 @@ TARGET_SCRIPT = CUSTOM_DIR / "train_dense_clip_langsplat_autoencoder.py"
 DEFAULT_IMAGES_DIR = CUSTOM_DIR / "trial_images"
 DEFAULT_LOG_DIR = CUSTOM_DIR / "dense_clip_optimization_logs"
 PROFILES = {
-    "smoke": {"num_epochs": 5},
-    "quality": {"num_epochs": 50},
+    "smoke": {"num_epochs": 2},
+    "quality": {"num_epochs": 20},
 }
 
 
